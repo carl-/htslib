@@ -296,7 +296,7 @@ bcf_hrec_t *bcf_hdr_parse_line(const bcf_hdr_t *h, const char *line, int *len)
     p += 2;
 
     const char *q = p;
-    while ( *q && *q!='=' ) q++;
+    while ( *q && *q!='=' && *q != '\n' ) q++;
     int n = q-p;
     if ( *q!='=' || !n ) { *len = q-line+1; return NULL; } // wrong format
 
@@ -337,10 +337,8 @@ bcf_hrec_t *bcf_hdr_parse_line(const bcf_hdr_t *h, const char *line, int *len)
         {
             // wrong format
             while ( *q && *q!='\n' ) q++;
-            kstring_t tmp = {0,0,0};
-            kputsn(line,q-line,&tmp);
-            fprintf(stderr,"Could not parse the header line: \"%s\"\n", tmp.s);
-            free(tmp.s);
+            fprintf(stderr,"Could not parse the header line: \"%.*s\"\n",
+                    (int) (q - line), line);
             *len = q - line + (*q ? 1 : 0);
             bcf_hrec_destroy(hrec);
             return NULL;
@@ -369,8 +367,15 @@ bcf_hrec_t *bcf_hdr_parse_line(const bcf_hdr_t *h, const char *line, int *len)
         if ( *q=='>' ) { nopen--; q++; }
     }
 
-    // Skip trailing spaces
-    while ( *q && *q==' ' ) { q++; }
+    // Skip to end of line
+    int nonspace = 0;
+    p = q;
+    while ( *q && *q!='\n' ) { nonspace |= !isspace(*q); q++; }
+    if (nonspace && hts_verbose > 2) {
+        fprintf(stderr,
+                "[W::%s] Dropped trailing junk from header line '%.*s'\n",
+                __func__, (int) (q - line), line);
+    }
 
     *len = q - line + (*q ? 1 : 0);
     return hrec;
@@ -626,7 +631,7 @@ void bcf_hdr_check_sanity(bcf_hdr_t *hdr)
 
 int bcf_hdr_parse(bcf_hdr_t *hdr, char *htxt)
 {
-    int len, needs_sync = 0;
+    int len, needs_sync = 0, done = 0;
     char *p = htxt;
 
     // Check sanity: "fileformat" string must come as first
@@ -640,11 +645,41 @@ int bcf_hdr_parse(bcf_hdr_t *hdr, char *htxt)
     needs_sync += bcf_hdr_add_hrec(hdr, hrec);
 
     // Parse the whole header
-    while ( (hrec=bcf_hdr_parse_line(hdr,p,&len)) )
-    {
-        needs_sync += bcf_hdr_add_hrec(hdr, hrec);
-        p += len;
+    do {
+        while (NULL != (hrec = bcf_hdr_parse_line(hdr, p, &len))) {
+            needs_sync += bcf_hdr_add_hrec(hdr, hrec);
+            p += len;
+        }
+
+        // Next should be the sample line.  If not, it was a malformed
+        // header, in which case print a warning and skip (many VCF
+        // operations do not really care about a few malformed lines).
+        // In the future we may want to add a strict mode that errors in
+        // this case.
+        if ( strncmp("#CHROM\tPOS",p,10) != 0 ) {
+            char *eol = strchr(p, '\n');
+            if (hts_verbose >= 2 && *p != '\0')
+                    fprintf(stderr,
+                            "[W::%s] Couldn't parse header line: %.*s\n",
+                            __func__, eol ? (int) (eol - p) : INT_MAX, p);
+            if (eol) {
+                p = eol + 1; // Try from the next line.
+            } else {
+                done = -1; // No more lines left, give up.
+            }
+        } else {
+            done = 1; // Sample line found
+        }
+    } while (!done);
+
+    if (done < 0) {
+        // No sample line is fatal.
+        if (hts_verbose >= 1)
+            fprintf(stderr, "[E::%s] Could not parse the header, "
+                    "sample line not found\n", __func__);
+        return -1;
     }
+
     int ret = bcf_hdr_parse_sample_line(hdr,p);
     bcf_hdr_sync(hdr);
     bcf_hdr_check_sanity(hdr);
@@ -836,6 +871,13 @@ bcf_hdr_t *bcf_hdr_read(htsFile *hfp)
 {
     if (hfp->format.format == vcf)
         return vcf_hdr_read(hfp);
+    if (hfp->format.format != bcf) {
+        fprintf(stderr, "[E::%s] Input is not detected as bcf or vcf format\n",
+                __func__);
+        return NULL;
+    }
+
+    assert(hfp->is_bgzf);
 
     BGZF *fp = hfp->fp.bgzf;
     uint8_t magic[5];
@@ -870,7 +912,7 @@ bcf_hdr_t *bcf_hdr_read(htsFile *hfp)
     if (!htxt) goto fail;
     if (bgzf_read(fp, htxt, hlen) != hlen) goto fail;
     htxt[hlen] = '\0'; // Ensure htxt is terminated
-    bcf_hdr_parse(h, htxt);  // FIXME: Does this return anything meaningful?
+    if ( bcf_hdr_parse(h, htxt) < 0 ) goto fail;
     free(htxt);
     return h;
  fail:
@@ -1547,7 +1589,7 @@ bcf_hdr_t *vcf_hdr_read(htsFile *fp)
         fprintf(stderr,"[%s:%d %s] Could not read the header\n", __FILE__,__LINE__,__FUNCTION__);
         goto error;
     }
-    bcf_hdr_parse(h, txt.s);
+    if ( bcf_hdr_parse(h, txt.s) < 0 ) goto error;
 
     // check tabix index, are all contigs listed in the header? add the missing ones
     tbx_t *idx = tbx_index_load(fp->fn);
@@ -2767,7 +2809,10 @@ bcf_hdr_t *bcf_hdr_merge(bcf_hdr_t *dst, const bcf_hdr_t *src)
         dst = bcf_hdr_init("r");
         kstring_t htxt = {0,0,0};
         bcf_hdr_format(src, 0, &htxt);
-        bcf_hdr_parse(dst, htxt.s);
+        if ( bcf_hdr_parse(dst, htxt.s) < 0 ) {
+            bcf_hdr_destroy(dst);
+            dst = NULL;
+        }
         free(htxt.s);
         return dst;
     }
@@ -2956,7 +3001,10 @@ bcf_hdr_t *bcf_hdr_dup(const bcf_hdr_t *hdr)
     }
     kstring_t htxt = {0,0,0};
     bcf_hdr_format(hdr, 1, &htxt);
-    bcf_hdr_parse(hout, htxt.s);
+    if ( bcf_hdr_parse(hout, htxt.s) < 0 ) {
+        bcf_hdr_destroy(hout);
+        hout = NULL;
+    }
     free(htxt.s);
     return hout;
 }
@@ -3003,7 +3051,10 @@ bcf_hdr_t *bcf_hdr_subset(const bcf_hdr_t *h0, int n, char *const* samples, int 
     } else kputsn(htxt.s, htxt.l, &str);
     while (str.l && (!str.s[str.l-1] || str.s[str.l-1]=='\n') ) str.l--; // kill trailing zeros and newlines
     kputc('\n',&str);
-    bcf_hdr_parse(h, str.s);
+    if ( bcf_hdr_parse(h, str.s) < 0 ) {
+        bcf_hdr_destroy(h);
+        h = NULL;
+    }
     free(str.s);
     free(htxt.s);
     khash_str2int_destroy(names_hash);
@@ -3144,6 +3195,7 @@ static void bcf_set_variant_type(const char *ref, const char *alt, variant_t *va
 
     if ( *a && !*r )
     {
+        if ( *a==']' || *a=='[' ) { var->type = VCF_BND; return; }
         while ( *a ) a++;
         var->n = (a-alt)-(r-ref); var->type = VCF_INDEL; return;
     }
