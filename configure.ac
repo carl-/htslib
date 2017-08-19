@@ -182,6 +182,11 @@ is installed.
 FAILED.  This error must be resolved in order to build HTSlib successfully.])
 fi
 
+dnl connect() etc. fns are in libc on linux, but libsocket on illumos/Solaris
+libsocket=unneeded
+AC_SEARCH_LIBS(connect, socket, [libsocket=needed], [])
+
+
 if test "$enable_bz2" != no; then
   bz2_devel=ok
   AC_CHECK_HEADER([bzlib.h], [], [bz2_devel=missing], [;])
@@ -329,6 +334,10 @@ dnl Only need to add to static_LIBS if not building as a plugin
      static_LIBS="$static_LIBS $CRYPTO_LIBS"
   fi
 fi
+
+dnl Look for PTHREAD_MUTEX_RECURSIVE.
+dnl This is normally in pthread.h except on some broken glibc implementations.
+AC_CHECK_DECL(PTHREAD_MUTEX_RECURSIVE, [], [AC_DEFINE([_XOPEN_SOURCE],[600], [Needed for PTHREAD_MUTEX_RECURSIVE])], [[#include <pthread.h>]])
 
 if test "$s3" = enabled ; then
    AC_DEFINE([ENABLE_S3], 1, [Define if HTSlib should enable S3 support.])
